@@ -1,0 +1,562 @@
+#!/usr/bin/env perl
+## Copyright © 2010 by Daniel Friesel <derf@finalrewind.org>
+## License: WTFPL <http://sam.zoy.org/wtfpl>
+##   0. You just DO WHAT THE FUCK YOU WANT TO.
+use strict;
+use warnings;
+use 5.010;
+use autodie;
+
+use Cwd;
+use Digest::SHA qw(sha1_hex);
+use File::Copy;
+use File::Find;
+use Getopt::Long;
+use IO::Handle;
+use Storable qw(nstore retrieve);
+use Time::Progress;
+
+my $base = getcwd();
+my $rel_paths = 1;
+my $read_size = (2 ** 20) * 4; # 4 MiB
+my $db_file = '.hashl.db';
+my $total = 0;
+my $cur = 0;
+my $show_progress = 1;
+my $timer;
+my $incoming_dir;
+my ($find_ref, $find_db_write);
+
+my $VERSION = '0.1';
+
+my $db;
+
+STDERR->autoflush(1);
+
+GetOptions(
+	'd|database=s'  => \$db_file,
+	'n|no-progress' => sub { $show_progress = 0 },
+	's|read-size=i' => sub { $read_size = $_[1] * 1024 },
+	'V|version'     => sub { say "hashl version ${VERSION}"; exit 0 },
+) or usage();
+
+if (substr($db_file, 0, 1) ne '/') {
+	$db_file = "${base}/${db_file}";
+}
+
+my $action = shift;
+
+sub usage {
+	die(<<"EOF");
+Usage: $0 [options] <update|list|info|...> [args]
+See 'perldoc -F $0' (or 'man hashl' if it is properly installed)
+EOF
+
+}
+
+if (not defined $action) {
+	usage();
+}
+
+if (-r $db_file) {
+	$db = retrieve($db_file);
+	$read_size = $db->{'config'}->{'read_size'};
+}
+else {
+	$db->{'config'} = {
+		read_size => $read_size,
+	}
+}
+
+sub get_total {
+	my $file = $File::Find::name;
+	if (-f $file and not -l $file and $file ne $db_file) {
+		$total++;
+	}
+}
+
+sub si_size {
+	my @post = (' ', 'k', 'M', 'G', 'T');
+	my $bytes = shift;
+	while ($bytes > 1024) {
+		$bytes /= 1024;
+		shift @post;
+	}
+	return sprintf("%6.1f%s", $bytes, $post[0]);
+}
+
+sub drop_deleted {
+	for my $file (keys %{$db->{'files'}}) {
+		if (! -e $file) {
+			delete $db->{'files'}->{$file};
+		}
+	}
+}
+
+sub copy_file {
+	my ($file, $to) = @_;
+
+	my $base = substr($file, length($base) + 1);
+	if ($base =~ s{ / [^/]+ $}{}x) {
+		mkdirs($incoming_dir, $base);
+	}
+
+	copy($file, "${to}/${base}");
+}
+
+sub hash_file {
+	my ($file) = @_;
+	my ($fh, $data);
+
+	open($fh, '<', $file);
+	binmode($fh);
+	read($fh, $data, $read_size);
+	close($fh);
+
+	return sha1_hex($data);
+}
+
+sub hash_in_db {
+	my ($hash) = @_;
+
+	if ($db->{'ignored'}->{'hashes'}) {
+		for my $ihash (@{$db->{'ignored'}->{'hashes'}}) {
+			if ($hash eq $ihash) {
+				return '// ignored';
+			}
+		}
+	}
+
+	for my $name (keys %{$db->{'files'}}) {
+		my $file = $db->{'files'}->{$name};
+
+		if ($file->{'hash'} eq $hash) {
+			return $name;
+		}
+	}
+	return undef;
+}
+
+sub file_in_db {
+	my ($file) = @_;
+
+	return hash_in_db(hash_file($file));
+}
+
+sub db_find_new {
+	my ($file, $path) = @_;
+
+	if (not defined file_in_db($path)) {
+		say "\r\e[2K${file}";
+	}
+}
+
+sub db_find_known {
+	my ($file, $path) = @_;
+	my $in_db = file_in_db($path);
+
+	if (defined $in_db) {
+		say "\r\e[2K${file}";
+	}
+}
+
+sub db_info {
+	printf(
+		"Read size: %d bytes (%s)\n",
+		$db->{'config'}->{'read_size'},
+		si_size($db->{'config'}->{'read_size'}),
+	);
+}
+
+sub file_info {
+	my ($file) = @_;
+
+	printf(
+		"File: %s\nSize: %d bytes (%s)\nHash: %s\n",
+		$file,
+		$db->{'files'}->{$file}->{'size'},
+		si_size($db->{'files'}->{$file}->{'size'}),
+		$db->{'files'}->{$file}->{'hash'},
+	);
+}
+
+sub process_file {
+	my ($code, $write) = ($find_ref, $find_db_write);
+	my $file = $File::Find::name;
+	my $path = $file;
+
+	if (not -f $file or -l $file or $file eq $db_file) {
+		return;
+	}
+
+	if ($rel_paths) {
+		$file = substr($file, length($base) + 1);
+	}
+
+	$cur++;
+
+	if ($show_progress) {
+		print STDERR $timer->report(
+			"\r\e[2KUpdating: %p done, %L elapsed, %E remaining",
+			$cur,
+		);
+	}
+
+	&{$code}($file, $path);
+
+	if ($write and (($cur % 100) == 0)) {
+		nstore($db, $db_file);
+	}
+}
+
+sub db_update {
+	my ($file, $path) = @_;
+	my ($size, $mtime) = (stat($path))[7,9];
+
+	if (exists($db->{'files'}->{$file}) and
+			$db->{'files'}->{$file}->{'mtime'} == $mtime and
+			$db->{'files'}->{$file}->{'size'} == $size ) {
+		return;
+	}
+
+	$db->{'files'}->{$file} = {
+		hash => hash_file($path),
+		mtime => $mtime,
+		size => $size,
+	};
+}
+
+sub db_ignore {
+	my ($file, $path) = @_;
+	my $hash = hash_file($path);
+
+	if (hash_in_db($hash)) {
+		return;
+	}
+
+	push(@{$db->{'ignored'}->{'hashes'}}, $hash);
+}
+
+sub db_copy {
+	my ($file, $path) = @_;
+
+	if (not defined file_in_db($path)) {
+		copy_file($path, $incoming_dir);
+	}
+}
+
+sub mkdirs {
+	my ($base, $new) = @_;
+
+	for my $dir (split(qr{/}, $new)) {
+		$base .= "/$dir";
+		if (! -d $base) {
+			mkdir($base);
+		}
+	}
+}
+
+sub prepare_db_run {
+	my ($dir) = @_;
+	$dir //= $base;
+
+	if (not $show_progress) {
+		return;
+	}
+
+	find(\&get_total, $dir);
+
+	$timer = Time::Progress->new();
+	$timer->attr(
+		min => 1,
+		max => $total,
+	);
+	return;
+}
+
+sub cmd_copy {
+	prepare_db_run();
+	($incoming_dir) = @_;
+
+	if (not $incoming_dir) {
+		usage();
+	}
+
+	if (substr($incoming_dir, 0, 1) ne '/') {
+		$incoming_dir = $base . '/' . $incoming_dir;
+	}
+
+	$find_ref = \&db_copy;
+	$find_db_write = 0;
+	find(\&process_file, $base);
+	print "\n";
+}
+
+sub cmd_find_known {
+	my ($dir) = @_;
+
+	$dir //= $base;
+
+	if (substr($dir, 0, 1) ne '/') {
+		$dir = $base . '/' . $dir;
+	}
+
+	prepare_db_run($dir);
+
+	$find_ref = \&db_find_known;
+	$find_db_write = 0;
+	find(\&process_file, $dir);
+	print "\n";
+}
+
+sub cmd_find_new {
+	my ($new_dir) = @_;
+
+	$new_dir //= $base;
+
+	if (substr($new_dir, 0, 1) ne '/') {
+		$new_dir = $base . '/' . $new_dir;
+	}
+
+	prepare_db_run($new_dir);
+
+	$find_ref = \&db_find_new;
+	$find_db_write = 0;
+	find(\&process_file, $new_dir);
+	print "\n";
+}
+
+sub cmd_ignore {
+	my ($ign_dir) = @_;
+
+	$ign_dir //= $base;
+
+	prepare_db_run();
+
+	if (substr($ign_dir, 0, 1) ne '/') {
+		$ign_dir = $base . '/' . $ign_dir;
+	}
+
+	$find_ref = \&db_ignore;
+	$find_db_write = 1;
+	find(\&process_file, $base);
+	nstore($db, $db_file);
+	print "\n";
+}
+
+sub cmd_info {
+	my ($file) = @_;
+
+	if ($file) {
+		file_info($file);
+	}
+	else {
+		db_info();
+	}
+}
+
+sub cmd_list {
+	printf(
+		"# hashl v%s   Read Size %d bytes (%s)\n",
+		$VERSION,
+		$db->{'config'}->{'read_size'},
+		si_size($db->{'config'}->{'read_size'}),
+	);
+	for my $name (sort keys %{$db->{'files'}}) {
+		my $file = $db->{'files'}->{$name};
+		printf(
+			"%s %-7s %s\n",
+			$file->{'hash'},
+			si_size($file->{'size'}),
+			$name
+		);
+	}
+}
+
+sub cmd_list_files {
+	say join("\n", sort keys %{$db->{'files'}});
+}
+
+sub cmd_list_ignored {
+	if (exists $db->{'ignored'}->{'hashes'}) {
+		for my $hash (@{$db->{'ignored'}->{'hashes'}}) {
+			say $hash;
+		}
+	}
+}
+
+sub cmd_update {
+	drop_deleted();
+	prepare_db_run();
+	$find_ref = \&db_update;
+	$find_db_write = 1;
+	find(\&process_file, $base);
+	print "\n";
+	nstore($db, $db_file);
+}
+
+given ($action) {
+	when ('copy')         { cmd_copy(@ARGV) }
+	when ('find-known')   { cmd_find_known(@ARGV) }
+	when ('find-new')     { cmd_find_new(@ARGV) }
+	when ('ignore')       { cmd_ignore(@ARGV) }
+	when ('info')         { cmd_info(@ARGV) }
+	when ('list')         { cmd_list(@ARGV) }
+	when ('list-files')   { cmd_list_files(@ARGV) }
+	when ('list-ignored') { cmd_list_ignored(@ARGV) }
+	when ('update')       { cmd_update(@ARGV) }
+	default { usage() }
+}
+
+__END__
+
+=head1 NAME
+
+B<hashl> - Create database with partial file hashes, check if other files are in it
+
+=head1 SYNOPSIS
+
+B<hashl> [B<-d> I<dbfile>] [B<-s> I<read-size>] I<action> [I<args>]
+
+=head1 DESCRIPTION
+
+Actions:
+
+=over
+
+=item B<copy> I<newdir>
+
+Copy all files in the current directory which are not in the database to
+I<newdir>.
+
+=item B<find-known> [I<directory>]
+
+List all files which are already in the database.  Scans either the current
+directory or I<directory>.
+
+=item B<find-new> [I<directory>]
+
+List all files which are not in the database.  Scans either the current
+directory or I<directory>.
+
+=item B<ignore> [I<directory>]
+
+Add all files in I<directory> (or the current directory) as "ignored" to the
+database.  This means that hashl will save the file's hash and skip matching
+files for B<copy> or B<find-new>.
+
+=item B<info> [I<file>]
+
+Show information on I<file> (or the database, if I<file> is not specified).
+
+=item B<list>
+
+List all files and their hashes.  The list format is C<< hash size file >>.
+
+=item B<list-files>
+
+List all filenames, one file per line.
+
+=item B<list-ignored>
+
+List ignored hashes.
+
+=item B<update>
+
+Update or create hash database.  Iterates over all files below the current
+directory.
+
+=back
+
+=head1 OPTIONS
+
+=over
+
+=item B<-d>|B<--database> I<dbfile>
+
+Use I<dbfile> instead of F<.hashl.db>
+
+=item B<-n>|B<--no-progress>
+
+Do not show progress information.  Most useful with C<< hashl find-new >>.
+
+=item B<-s>|B<--read-size> I<kibibytes>
+
+Change size of the part of each file which is hashed.  By default, B<hashl>
+hashes the first 4 MiB.  Note that this option only makes sense when using C<<
+hashl update >> to create a new database.
+
+=item B<-V>|B<--version>
+
+Print version information.
+
+=back
+
+=head1 CONFIGURATION
+
+None, so far
+
+=head1 DEPENDENCIES
+
+=over
+
+=item * autodie (included with perl E<gt>= 5.10.1)
+
+=item * Digest::SHA
+
+=item * Time::Progress
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+Unknown.  This is beta software.
+
+=head1 EXAMPLES
+
+=head2 LEECHING
+
+First, create a database of your local files:
+
+C<< cd /media/videos; hashl update >>
+
+Now, assume you have a (possibly slow) external share mounted at
+F</tmp/mnt/ext>.  You do not want to copy all files to your disk and then use
+B<fdupes> or similar to weed out the duplicates.  Since you just used B<hashl>
+to create a database with the hashes of the first 4MB of all your files, you
+can now use it to check if you (very probably) already have any remote file.
+For that, you only need to leech the first 4MB of every file on the share, and
+not the whole file.  For example:
+
+C<< cd /tmp/mnt/ext; hashl copy /media/videos/incoming >>
+
+=head2 EXTERNAL HARD DISK
+
+Personally, I have all my videos on an external hard disk, which I usually do
+not carry with me.  So, when I get new videos, I put them into F<~/lib/videos>
+on my netboo, and then later copy them to the external disk.  Of course, it
+can always happen that I get a movie I already have, or forget to move
+something from F<~/lib/videos> to the external disk, especially since I also
+always have some stuff from the disk in F<~/lib/videos>.
+
+However, I can use B<hashl> to conveniently solve this issue.  Run
+periodically:
+
+C<< cd /media/argon; hashl -d ~/lib/video/.argon update >>
+
+Now, I always have a list of files on the external disk with me.  When I get a
+new file:
+
+C<< hashl -d ~/lib/video/.argon new-file $file >>
+
+And to find out which files are not on the external disk:
+
+C<< cd ~/lib/video; print -l **/*(.) | hashl -d .argon new-file >>
+
+=head1 AUTHOR
+
+Copyright (C) 2010 by Daniel Friesel E<lt>derf@finalrewind.orgE<gt>
+
+=head1 LICENSE
+
+  0. You just DO WHAT THE FUCK YOU WANT TO.

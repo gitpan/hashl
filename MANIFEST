@@ -1,0 +1,17 @@
+bin/hashl
+Build.PL
+Changelog
+COPYING
+MANIFEST			This list of files
+MANIFEST.SKIP
+README
+t/00-compile.t
+t/10-pod-coverage.t
+t/50-integration.t
+t/in/1023k
+t/in/1024k
+t/in/1025k
+t/in/1k
+t/in/4
+t/in/4096k
+META.yml

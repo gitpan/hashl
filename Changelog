@@ -1,0 +1,7 @@
+hashl 0.1 - Fri May 06 2011
+
+    * Initial release
+    * Create/Update hash database
+    * Find/Copy files not in database
+    * Ignore files (will be marked as known, but can be removed from the file
+      system)

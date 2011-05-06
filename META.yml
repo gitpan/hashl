@@ -1,0 +1,27 @@
+---
+name: hashl
+version: 0.1
+author:
+  - 'Copyright (C) 2010 by Daniel Friesel E<lt>derf@finalrewind.orgE<gt>'
+abstract: 'Create database with partial file hashes, check if other files are in it'
+license: unrestricted
+build_requires:
+  Test::Compile: 0
+  Test::More: 0
+  Test::Pod: 0
+requires:
+  Digest::SHA: 0
+  File::Copy: 0
+  File::Find: 0
+  Getopt::Long: 0
+  IO::Handle: 0
+  Storable: 0
+  Time::Progress: 0
+  autodie: 0
+  perl: v5.10.0
+configure_requires:
+  Module::Build: 0.340201
+generated_by: Module::Build version 0.340201
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
